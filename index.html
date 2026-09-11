@@ -3,8 +3,6 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<link rel="apple-touch-icon" href="apple-touch-icon.png" />
-<link rel="icon" href="apple-touch-icon.png" />
 <title>Heti teendők</title>
 </head>
 <body style="margin:0;">
@@ -13,6 +11,14 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js"></script>
+<script>
+  if (typeof pdfjsLib !== "undefined") {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js";
+  }
+</script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
@@ -130,6 +136,36 @@ function buildFloralTile() {
 const FLORAL_BG = buildFloralTile();
 
 const DAY_NAMES = ["Hétfő", "Kedd", "Szerda", "Csütörtök", "Péntek", "Szombat", "Vasárnap"];
+const HOURS = Array.from({ length: 17 }, (_, i) => i + 6); // 6..22
+const DAY_START_MIN = 6 * 60;
+const DAY_END_MIN = 22 * 60;
+const HOUR_HEIGHT = 48;
+const TIMELINE_HEIGHT = ((DAY_END_MIN - DAY_START_MIN) / 60) * HOUR_HEIGHT;
+
+function timeToMinutes(t) {
+  if (!t) return null;
+  const parts = String(t).split(":");
+  const h = parseInt(parts[0], 10);
+  const m = parseInt(parts[1], 10) || 0;
+  if (isNaN(h)) return null;
+  return h * 60 + m;
+}
+function clampMin(m) { return Math.max(DAY_START_MIN, Math.min(DAY_END_MIN, m)); }
+
+// Egyszerű, kapzsi oszlop-kiosztás az egy időben átfedő eseményekhez
+// (mint a Google Naptárban, ha két esemény egyszerre van).
+function assignColumns(events) {
+  const sorted = [...events].sort((a, b) => a.start - b.start);
+  const colEnds = [];
+  const placed = sorted.map((ev) => {
+    let col = colEnds.findIndex((end) => end <= ev.start);
+    if (col === -1) { col = colEnds.length; colEnds.push(ev.end); }
+    else { colEnds[col] = ev.end; }
+    return { ...ev, col };
+  });
+  const totalCols = Math.max(1, colEnds.length);
+  return placed.map((p) => ({ ...p, totalCols }));
+}
 const DAY_LETTERS = ["H", "K", "Sz", "Cs", "P", "Sz", "V"];
 const MONTH_NAMES = [
   "Január", "Február", "Március", "Április", "Május", "Június",
@@ -162,8 +198,70 @@ const CATEGORY_FILTERS = [
   { value: "munka", label: "Munka" },
 ];
 
+const PASTEL_COLORS = [
+  { name: "Rózsaszín", hex: "#F8D7DA" },
+  { name: "Barack", hex: "#FCE1C0" },
+  { name: "Vajsárga", hex: "#FBF3B9" },
+  { name: "Menta", hex: "#D7F0D1" },
+  { name: "Türkiz", hex: "#C7ECE6" },
+  { name: "Égkék", hex: "#CFE3F7" },
+  { name: "Levendula", hex: "#DED2F5" },
+  { name: "Orgona", hex: "#F0D4E8" },
+];
+function darkenHex(hex, amount) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.max(0, ((n >> 16) & 255) - amount);
+  const g = Math.max(0, ((n >> 8) & 255) - amount);
+  const b = Math.max(0, (n & 255) - amount);
+  return `rgb(${r},${g},${b})`;
+}
+
 function pad(n) { return n < 10 ? "0" + n : "" + n; }
 function dateKey(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+
+const HU_MONTHS = {
+  "január": 1, "február": 2, "március": 3, "április": 4, "május": 5, "június": 6,
+  "július": 7, "augusztus": 8, "szeptember": 9, "október": 10, "november": 11, "december": 12,
+};
+// Rugalmas dátum-idő felismerés: "2026. szeptember 7. 10:00" formátumhoz,
+// de elfogad ISO-szerű vagy simán "2026-09-07 10:00" jellegű bejegyzéseket is.
+function parseFlexibleDateTime(raw) {
+  if (raw == null) return null;
+  if (raw instanceof Date && !isNaN(raw)) return raw;
+  const s = String(raw).trim();
+  let m = s.match(/(\d{4})\.\s*([a-záéíóöőúüű]+)\s*(\d{1,2})\.?\s*(\d{1,2}):(\d{2})/i);
+  if (m) {
+    const month = HU_MONTHS[m[2].toLowerCase()];
+    if (month) return new Date(Number(m[1]), month - 1, Number(m[3]), Number(m[4]), Number(m[5]));
+  }
+  m = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]));
+  m = s.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})\.?\s*(\d{1,2}):(\d{2})/);
+  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]), Number(m[4]), Number(m[5]));
+  const d = new Date(s);
+  return isNaN(d) ? null : d;
+}
+
+// Oszlop-felismerés különböző elnevezésekhez (magyar Neptun-export és általánosabb változatok)
+const COLUMN_ALIASES = {
+  start: ["kezdés", "kezdet", "start", "dátum"],
+  end: ["befejezés", "vég", "end"],
+  name: ["név", "tantárgy", "cím", "title", "subject", "óra", "tanóra", "esemény"],
+};
+function findColumnIndex(headerRow, aliases) {
+  for (let i = 0; i < headerRow.length; i++) {
+    const cell = String(headerRow[i] || "").toLowerCase().trim();
+    if (aliases.some((a) => cell.includes(a))) return i;
+  }
+  return -1;
+}
+function findHeaderRow(rows) {
+  for (let i = 0; i < Math.min(rows.length, 5); i++) {
+    const idx = findColumnIndex(rows[i] || [], COLUMN_ALIASES.start);
+    if (idx !== -1) return i;
+  }
+  return -1;
+}
 function addDays(d, n) { return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n); }
 function getMonday(d) {
   const day = d.getDay();
@@ -193,6 +291,7 @@ function buildMonthMatrix(monthDate) {
 function taskOccursOn(task, d) {
   const diff = daysBetween(task.anchorDate, d);
   if (diff < 0) return false;
+  if (task.excludedDates && task.excludedDates.includes(dateKey(d))) return false;
   switch (task.recurrence) {
     case "none": return diff === 0;
     case "daily": return true;
@@ -205,7 +304,8 @@ function taskOccursOn(task, d) {
 let uidCounter = 1;
 function nextId() { return uidCounter++; }
 
-const today = new Date();
+function getToday() { return new Date(); }
+const today = getToday(); // csak a kezdeti minta-adatokhoz (modul-szintű)
 
 const SEED_TASKS = [
   { id: nextId(), text: "Bevásárlás", anchorDate: new Date(today.getFullYear(), today.getMonth(), today.getDate()), recurrence: "none", category: "none", completions: {} },
@@ -221,19 +321,406 @@ const SEED_GENERAL = [
 ];
 
 function WeeklyPlanner() {
-  const [weekStart, setWeekStart] = useState(getMonday(today));
+  const [weekStart, setWeekStart] = useState(getMonday(getToday()));
   const [tasks, setTasks] = useState([]);
   const [generalTasks, setGeneralTasks] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [syncError, setSyncError] = useState(false);
   const [generalText, setGeneralText] = useState("");
   const [generalCategory, setGeneralCategory] = useState("none");
+  const [generalColor, setGeneralColor] = useState(null);
   const [addingFor, setAddingFor] = useState(null);
   const [newText, setNewText] = useState("");
   const [newRecurrence, setNewRecurrence] = useState("none");
   const [newCategory, setNewCategory] = useState("none");
+  const [newColor, setNewColor] = useState(null);
+  const [newStartTime, setNewStartTime] = useState("");
+  const [newEndTime, setNewEndTime] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("all");
-  const [selectedDay, setSelectedDay] = useState(today);
+  const [importMessage, setImportMessage] = useState(null);
+  const [lastImportIds, setLastImportIds] = useState([]);
+  const [expandedNotes, setExpandedNotes] = useState(() => new Set());
+  const [colorPickerOpen, setColorPickerOpen] = useState(() => new Set());
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [editingId, setEditingId] = useState(null);
+  const [editText, setEditText] = useState("");
+  const [editStartTime, setEditStartTime] = useState("");
+  const [editEndTime, setEditEndTime] = useState("");
+  const [editCategory, setEditCategory] = useState("none");
+  const [editRecurrence, setEditRecurrence] = useState("none");
+
+  function startEditText(task) {
+    setEditingId(task.id);
+    setEditText(task.text);
+    setEditStartTime(task.startTime || "");
+    setEditEndTime(task.endTime || "");
+    setEditCategory(task.category || "none");
+    setEditRecurrence(task.recurrence || "none");
+  }
+  function cancelEditText() {
+    setEditingId(null);
+    setEditText("");
+  }
+  function saveEditText() {
+    if (!editingId) return;
+    const text = editText.trim();
+    setTasks((ts) =>
+      ts.map((t) =>
+        t.id === editingId
+          ? {
+              ...t,
+              text: text || t.text,
+              startTime: editStartTime || null,
+              endTime: editEndTime || null,
+              category: editCategory,
+              recurrence: editRecurrence,
+            }
+          : t
+      )
+    );
+    setGeneralTasks((gs) =>
+      gs.map((g) => (g.id === editingId ? { ...g, text: text || g.text, category: editCategory } : g))
+    );
+    setEditingId(null);
+    setEditText("");
+  }
+  const fileInputRef = React.useRef(null);
+
+  function toggleNoteOpen(id) {
+    setExpandedNotes((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleColorPicker(id) {
+    setColorPickerOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function ColorSwatchRow({ value, onChange, small }) {
+    return (
+      <div style={{ display: "flex", gap: small ? 4 : 6, flexWrap: "wrap" }}>
+        <button
+          type="button"
+          onClick={() => onChange(null)}
+          title="Nincs szín"
+          style={{
+            width: small ? 16 : 20,
+            height: small ? 16 : 20,
+            borderRadius: "50%",
+            border: `1.5px solid ${COLORS.border}`,
+            background: "repeating-linear-gradient(45deg, #fff, #fff 2px, #eee 2px, #eee 4px)",
+            cursor: "pointer",
+            padding: 0,
+            outline: value === null ? `2px solid ${COLORS.accentDark}` : "none",
+            outlineOffset: 1,
+          }}
+        />
+        {PASTEL_COLORS.map((c) => (
+          <button
+            type="button"
+            key={c.hex}
+            onClick={() => onChange(c.hex)}
+            title={c.name}
+            style={{
+              width: small ? 16 : 20,
+              height: small ? 16 : 20,
+              borderRadius: "50%",
+              border: `1.5px solid ${darkenHex(c.hex, 25)}`,
+              background: c.hex,
+              cursor: "pointer",
+              padding: 0,
+              outline: value === c.hex ? `2px solid ${COLORS.accentDark}` : "none",
+              outlineOffset: 1,
+            }}
+          />
+        ))}
+        <label
+          title="Egyedi szín"
+          style={{
+            position: "relative",
+            display: "inline-block",
+            width: small ? 16 : 20,
+            height: small ? 16 : 20,
+            borderRadius: "50%",
+            border: `1.5px solid ${COLORS.border}`,
+            background: "conic-gradient(red, yellow, lime, cyan, blue, magenta, red)",
+            cursor: "pointer",
+            outline: value && !PASTEL_COLORS.some((c) => c.hex === value) ? `2px solid ${COLORS.accentDark}` : "none",
+            outlineOffset: 1,
+          }}
+        >
+          <input
+            type="color"
+            value={value && /^#/.test(value) ? value : "#ffffff"}
+            onChange={(e) => onChange(e.target.value)}
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              opacity: 0,
+              cursor: "pointer",
+              border: "none",
+              padding: 0,
+            }}
+          />
+        </label>
+      </div>
+    );
+  }
+
+  function EditFieldsPanel({ showTimeAndRecurrence }) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginTop: 5 }}>
+        {showTimeAndRecurrence && (
+          <div style={{ display: "flex", gap: 6 }}>
+            <input
+              type="time"
+              value={editStartTime}
+              onChange={(e) => setEditStartTime(e.target.value)}
+              title="Kezdés"
+              style={{ flex: 1, fontSize: 11, padding: "4px 5px", borderRadius: 7, border: `1px solid ${COLORS.border}`, background: "#fff", fontFamily: "'Work Sans', sans-serif" }}
+            />
+            <input
+              type="time"
+              value={editEndTime}
+              onChange={(e) => setEditEndTime(e.target.value)}
+              title="Vég"
+              style={{ flex: 1, fontSize: 11, padding: "4px 5px", borderRadius: 7, border: `1px solid ${COLORS.border}`, background: "#fff", fontFamily: "'Work Sans', sans-serif" }}
+            />
+          </div>
+        )}
+        <select
+          value={editCategory}
+          onChange={(e) => setEditCategory(e.target.value)}
+          style={{ fontSize: 11, padding: "4px 5px", borderRadius: 7, border: `1px solid ${COLORS.border}`, background: "#fff", fontFamily: "'Work Sans', sans-serif", color: COLORS.text }}
+        >
+          {CATEGORY_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
+        {showTimeAndRecurrence && (
+          <select
+            value={editRecurrence}
+            onChange={(e) => setEditRecurrence(e.target.value)}
+            style={{ fontSize: 11, padding: "4px 5px", borderRadius: 7, border: `1px solid ${COLORS.border}`, background: "#fff", fontFamily: "'Work Sans', sans-serif", color: COLORS.text }}
+          >
+            {RECUR_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+        )}
+        <div style={{ display: "flex", gap: 6 }}>
+          <button
+            onClick={saveEditText}
+            style={{ flex: 1, fontSize: 11, padding: "5px 0", borderRadius: 7, border: "none", background: COLORS.accent, color: "#fff", cursor: "pointer", fontWeight: 500 }}
+          >
+            Mentés
+          </button>
+          <button
+            onClick={cancelEditText}
+            style={{ fontSize: 11, padding: "5px 10px", borderRadius: 7, border: `1px solid ${COLORS.border}`, background: "transparent", color: COLORS.textSoft, cursor: "pointer" }}
+          >
+            Mégse
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  function handleImportClick() {
+    if (fileInputRef.current) fileInputRef.current.click();
+  }
+
+  function finalizeImport(imported, sourceLabel, extraNote) {
+    if (!imported || imported.length === 0) {
+      setImportMessage({
+        type: "error",
+        text: `Nem találtam felismerhető eseményt ebben a ${sourceLabel} fájlban.${extraNote ? " " + extraNote : ""}`,
+      });
+      return;
+    }
+    setTasks((ts) => [...ts, ...imported]);
+    setLastImportIds(imported.map((t) => t.id));
+    setImportMessage({
+      type: "success",
+      text: `${imported.length} esemény importálva (${sourceLabel}).${extraNote ? " " + extraNote : ""}`,
+    });
+  }
+
+  function undoImport() {
+    setTasks((ts) => ts.filter((t) => !lastImportIds.includes(t.id)));
+    setLastImportIds([]);
+    setImportMessage(null);
+  }
+
+  // Szabad szöveges (PDF-ből kinyert, vagy OCR-ezett) tartalom sorról-sorra
+  // átvizsgálása: minden sorban dátum+idő mintát keres, a maradék szöveget
+  // névnek tekinti. Ez becslés jellegű, ezért kép/PDF esetén érdemes
+  // utólag ellenőrizni az eredményt.
+  function parseGenericScheduleText(text) {
+    const dtPattern = /(\d{4}\.\s*[a-záéíóöőúüű]+\s*\d{1,2}\.?\s*\d{1,2}:\d{2}|\d{4}-\d{1,2}-\d{1,2}[ T]\d{1,2}:\d{2}|\d{1,2}\.\d{1,2}\.\d{4}\.?\s*\d{1,2}:\d{2})/gi;
+    const lines = text.split(/\r?\n/);
+    const imported = [];
+    for (const line of lines) {
+      const matches = line.match(dtPattern);
+      if (!matches || matches.length === 0) continue;
+      const startDate = parseFlexibleDateTime(matches[0]);
+      if (!startDate) continue;
+      const endDate = matches[1] ? parseFlexibleDateTime(matches[1]) : null;
+      let rest = line;
+      matches.forEach((m) => { rest = rest.replace(m, " "); });
+      rest = rest.replace(/[|;]+/g, " ").replace(/\s{2,}/g, " ").trim();
+      if (!rest) rest = "Esemény";
+      const startTime = `${pad(startDate.getHours())}:${pad(startDate.getMinutes())}`;
+      const endTime = endDate ? `${pad(endDate.getHours())}:${pad(endDate.getMinutes())}` : null;
+      imported.push({
+        id: nextId(),
+        text: rest,
+        anchorDate: new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate()),
+        recurrence: "none",
+        category: "egyetem",
+        completions: {},
+        note: "",
+        startTime,
+        endTime,
+      });
+    }
+    return imported;
+  }
+
+  function importFromSpreadsheet(file) {
+    if (typeof XLSX === "undefined") {
+      setImportMessage({ type: "error", text: "Az importáló könyvtár nem tölthető be, ellenőrizd az internetkapcsolatot." });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const data = new Uint8Array(evt.target.result);
+        const workbook = XLSX.read(data, { type: "array" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: "" });
+
+        const headerRowIdx = findHeaderRow(rows);
+        if (headerRowIdx === -1) {
+          setImportMessage({ type: "error", text: "Nem sikerült felismerni az oszlopokat ebben a fájlban." });
+          return;
+        }
+        const headerRow = rows[headerRowIdx];
+        const startIdx = findColumnIndex(headerRow, COLUMN_ALIASES.start);
+        const endIdx = findColumnIndex(headerRow, COLUMN_ALIASES.end);
+        const nameIdx = findColumnIndex(headerRow, COLUMN_ALIASES.name);
+
+        if (startIdx === -1 || nameIdx === -1) {
+          setImportMessage({ type: "error", text: "Nem találtam kezdés- és névoszlopot a fájlban." });
+          return;
+        }
+
+        const imported = [];
+        for (let i = headerRowIdx + 1; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row || row.length === 0) continue;
+          const startDate = parseFlexibleDateTime(row[startIdx]);
+          if (!startDate) continue;
+          const name = String(row[nameIdx] || "").trim();
+          if (!name) continue;
+          const endDate = endIdx !== -1 ? parseFlexibleDateTime(row[endIdx]) : null;
+          const startTime = `${pad(startDate.getHours())}:${pad(startDate.getMinutes())}`;
+          const endTime = endDate ? `${pad(endDate.getHours())}:${pad(endDate.getMinutes())}` : null;
+          imported.push({
+            id: nextId(),
+            text: name,
+            anchorDate: new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate()),
+            recurrence: "none",
+            category: "egyetem",
+            completions: {},
+            note: "",
+            startTime,
+            endTime,
+          });
+        }
+        finalizeImport(imported, "táblázat");
+      } catch (err) {
+        setImportMessage({ type: "error", text: "Hiba történt a fájl feldolgozása közben." });
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function importFromPdf(file) {
+    if (typeof pdfjsLib === "undefined") {
+      setImportMessage({ type: "error", text: "A PDF-olvasó könyvtár nem tölthető be, ellenőrizd az internetkapcsolatot." });
+      return;
+    }
+    setImportMessage({ type: "info", text: "PDF feldolgozása…" });
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      try {
+        const typedarray = new Uint8Array(evt.target.result);
+        const pdf = await pdfjsLib.getDocument({ data: typedarray }).promise;
+        let fullText = "";
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const content = await page.getTextContent();
+          fullText += content.items.map((it) => it.str).join(" ") + "\n";
+        }
+        const imported = parseGenericScheduleText(fullText);
+        finalizeImport(
+          imported,
+          "PDF",
+          "Ha egy szkennelt/kép-alapú PDF-ről van szó, előfordulhat, hogy nem talált szöveget – ilyenkor próbáld képként feltölteni."
+        );
+      } catch (err) {
+        setImportMessage({ type: "error", text: "Nem sikerült beolvasni a PDF-et." });
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function importFromImage(file) {
+    if (typeof Tesseract === "undefined") {
+      setImportMessage({ type: "error", text: "A képfelismerő könyvtár nem tölthető be, ellenőrizd az internetkapcsolatot." });
+      return;
+    }
+    setImportMessage({ type: "info", text: "Kép felismerése folyamatban… ez eltarthat fél-egy percig." });
+    Tesseract.recognize(file, "hun+eng")
+      .then(({ data: { text } }) => {
+        const imported = parseGenericScheduleText(text);
+        finalizeImport(
+          imported,
+          "kép",
+          "A képfelismerés nem tökéletes, érdemes ellenőrizni és javítani a bekerült teendőket."
+        );
+      })
+      .catch(() => {
+        setImportMessage({ type: "error", text: "Nem sikerült feldolgozni a képet." });
+      });
+  }
+
+  function handleImportFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    const name = file.name.toLowerCase();
+    if (name.endsWith(".xlsx") || name.endsWith(".xls") || name.endsWith(".csv")) {
+      importFromSpreadsheet(file);
+    } else if (name.endsWith(".pdf") || file.type === "application/pdf") {
+      importFromPdf(file);
+    } else if (file.type.startsWith("image/")) {
+      importFromImage(file);
+    } else {
+      setImportMessage({ type: "error", text: "Nem támogatott fájltípus. Excel, PDF vagy kép fájlt tölts fel." });
+    }
+  }
+
+  const [selectedDay, setSelectedDay] = useState(getToday());
   const [windowWidth, setWindowWidth] = useState(
     typeof window !== "undefined" ? window.innerWidth : 1200
   );
@@ -245,6 +732,14 @@ function WeeklyPlanner() {
   }, []);
 
   const isCompact = windowWidth < 720;
+
+  // Percenkénti "ébresztő", hogy ha éjfél után is nyitva marad az app,
+  // a mai nap kiemelése és a lejárt feladatok tisztítása magától frissüljön.
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => forceTick((t) => t + 1), 60000);
+    return () => clearInterval(id);
+  }, []);
 
   // Élő Firestore-szinkronizálás: bármelyik eszközön történik változás,
   // az azonnal megjelenik a másikon is (onSnapshot valós idejű figyelő).
@@ -265,7 +760,7 @@ function WeeklyPlanner() {
 
         loadedTasks = loadedTasks.filter((t) => {
           if (t.recurrence !== "none") return true;
-          const isPast = daysBetween(t.anchorDate, today) > 0;
+          const isPast = daysBetween(t.anchorDate, getToday()) > 0;
           const wasCompleted = !!t.completions[dateKey(t.anchorDate)];
           return !(isPast && wasCompleted);
         });
@@ -360,20 +855,583 @@ function WeeklyPlanner() {
     setNewText("");
     setNewRecurrence("none");
     setNewCategory("none");
+    setNewStartTime("");
+    setNewEndTime("");
+    setNewColor(null);
   }
-  function closeAddForm() { setAddingFor(null); }
+  function closeAddForm() {
+    setAddingFor(null);
+    setNewStartTime("");
+    setNewEndTime("");
+    setNewColor(null);
+  }
 
   function submitTask(day) {
     const text = newText.trim();
     if (!text) return;
     setTasks((ts) => [
       ...ts,
-      { id: nextId(), text, anchorDate: new Date(day.getFullYear(), day.getMonth(), day.getDate()), recurrence: newRecurrence, category: newCategory, completions: {} },
+      {
+        id: nextId(),
+        text,
+        anchorDate: new Date(day.getFullYear(), day.getMonth(), day.getDate()),
+        recurrence: newRecurrence,
+        category: newCategory,
+        completions: {},
+        note: "",
+        startTime: newStartTime || null,
+        endTime: newEndTime || null,
+        color: newColor,
+      },
     ]);
     setAddingFor(null);
     setNewText("");
     setNewRecurrence("none");
     setNewCategory("none");
+    setNewStartTime("");
+    setNewEndTime("");
+    setNewColor(null);
+  }
+
+  function renderTaskItem(task, dKey, isTodayCol) {
+    const done = !!task.completions[dKey];
+    const shouldPulse = isTodayCol && task.recurrence !== "none" && !done;
+    return (
+      <div
+        key={task.id + dKey}
+        className={`task-row${shouldPulse ? " pulse-task" : ""}`}
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 5,
+          background: task.color || "#fff",
+          border: `1px solid ${task.color ? darkenHex(task.color, 25) : COLORS.border}`,
+          borderRadius: 10,
+          padding: "6px 8px",
+          minWidth: 0,
+          boxSizing: "border-box",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 }}>
+          <button
+            onClick={() => toggleCompletion(task.id, dKey)}
+            aria-label={done ? "Kész" : "Nincs kész"}
+            style={{
+              width: 20,
+              height: 20,
+              borderRadius: 6,
+              border: `1.5px solid ${COLORS.accent}`,
+              background: done ? COLORS.panel : "transparent",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              flexShrink: 0,
+              padding: 0,
+              fontSize: 12,
+              lineHeight: 1,
+            }}
+          >
+            {done && "✅"}
+          </button>
+          {editingId === task.id ? (
+            <input
+              autoFocus
+              value={editText}
+              onChange={(e) => setEditText(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") saveEditText(); if (e.key === "Escape") cancelEditText(); }}
+              style={{
+                fontSize: 13,
+                flex: "1 1 0%",
+                minWidth: 0,
+                border: `1px solid ${COLORS.accentDark}`,
+                borderRadius: 6,
+                padding: "2px 6px",
+                fontFamily: "'Work Sans', sans-serif",
+              }}
+            />
+          ) : (
+          <span
+            style={{
+              fontSize: 13,
+              flex: "1 1 0%",
+              minWidth: 0,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              textDecoration: done ? "line-through" : "none",
+              color: done ? COLORS.textSoft : COLORS.text,
+            }}
+          >
+            {task.startTime ? `${task.startTime}${task.endTime ? "–" + task.endTime : ""} ` : ""}
+            {task.text}
+          </span>
+          )}
+          <button
+            onClick={() => startEditText(task)}
+            aria-label="Szerkesztés"
+            title="Név szerkesztése"
+            style={{ border: "none", background: "transparent", cursor: "pointer", color: COLORS.textSoft, flexShrink: 0, padding: 0, marginTop: 3, fontSize: 12 }}
+          >
+            ✏️
+          </button>
+          <button
+            onClick={() => toggleColorPicker(task.id)}
+            aria-label="Szín"
+            title="Szín"
+            style={{
+              border: `1.5px solid ${task.color ? darkenHex(task.color, 25) : COLORS.border}`,
+              background: task.color || "repeating-linear-gradient(45deg, #fff, #fff 2px, #eee 2px, #eee 4px)",
+              width: 14,
+              height: 14,
+              borderRadius: "50%",
+              cursor: "pointer",
+              flexShrink: 0,
+              padding: 0,
+              marginTop: 3,
+            }}
+          />
+          <button
+            onClick={() => toggleNoteOpen(task.id)}
+            aria-label="Jegyzet"
+            title="Jegyzet"
+            style={{
+              border: "none",
+              background: "transparent",
+              cursor: "pointer",
+              color: task.note ? COLORS.accentDark : COLORS.textSoft,
+              opacity: 1,
+              flexShrink: 0,
+              padding: 0,
+              marginTop: 2,
+              fontSize: 13,
+              lineHeight: 1,
+            }}
+          >
+            🗒️
+          </button>
+          <button
+            onClick={() => requestDeleteTask(task, dKey)}
+            aria-label="Törlés"
+            style={{
+              border: "none",
+              background: "transparent",
+              cursor: "pointer",
+              color: COLORS.textSoft,
+              opacity: 1,
+              flexShrink: 0,
+              padding: 0,
+              marginTop: 2,
+            }}
+          >
+            <X size={13} />
+          </button>
+        </div>
+        {(task.category !== "none" || task.recurrence !== "none") && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 24 }}>
+            {task.category !== "none" && CATEGORY_STYLES[task.category] && (
+              <span
+                style={{
+                  fontSize: 10,
+                  fontWeight: 500,
+                  padding: "2px 7px",
+                  borderRadius: 999,
+                  background: CATEGORY_STYLES[task.category].bg,
+                  color: CATEGORY_STYLES[task.category].text,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {CATEGORY_STYLES[task.category].label}
+              </span>
+            )}
+            {task.recurrence !== "none" && (
+              <span title={RECUR_LABELS[task.recurrence]} style={{ color: COLORS.textSoft, display: "flex" }}>
+                <RefreshCw size={11} />
+              </span>
+            )}
+          </div>
+        )}
+        {colorPickerOpen.has(task.id) && (
+          <div style={{ marginTop: 4, marginLeft: 24, background: "#fff", border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 6 }}>
+            <ColorSwatchRow
+              value={task.color || null}
+              onChange={(c) => { updateTaskColor(task.id, c); toggleColorPicker(task.id); }}
+              small
+            />
+          </div>
+        )}
+        {editingId === task.id && (
+          <div style={{ marginLeft: 24, background: "#fff", border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 6 }}>
+            <EditFieldsPanel showTimeAndRecurrence />
+          </div>
+        )}
+        {expandedNotes.has(task.id) ? (
+          <textarea
+            value={task.note || ""}
+            onChange={(e) => updateTaskNote(task.id, e.target.value)}
+            placeholder="Jegyzet ehhez a teendőhöz…"
+            style={{
+              marginTop: 4,
+              marginLeft: 24,
+              fontSize: 12,
+              padding: "5px 7px",
+              borderRadius: 8,
+              border: `1px solid ${COLORS.border}`,
+              background: "#fff",
+              fontFamily: "'Work Sans', sans-serif",
+              resize: "vertical",
+              minHeight: 40,
+            }}
+          />
+        ) : task.note ? (
+          <div
+            onClick={() => toggleNoteOpen(task.id)}
+            style={{
+              marginTop: 4,
+              marginLeft: 24,
+              fontSize: 11,
+              fontStyle: "italic",
+              color: COLORS.textSoft,
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {task.note}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderEventBlock(task, dKey, isTodayCol, startMin, endMin) {
+    const done = !!task.completions[dKey];
+    const shouldPulse = isTodayCol && task.recurrence !== "none" && !done;
+    const catStyle = task.category !== "none" && CATEGORY_STYLES[task.category] ? CATEGORY_STYLES[task.category] : null;
+    const bg = task.color || (catStyle ? catStyle.bg : "#fff");
+    const textColor = task.color ? COLORS.text : (catStyle ? catStyle.text : COLORS.text);
+    const borderLeftColor = task.color ? darkenHex(task.color, 30) : COLORS.accent;
+    const heightPx = Math.max(20, ((endMin - startMin) / 60) * HOUR_HEIGHT);
+    const isTiny = heightPx < 34;
+    const topRowH = 16;
+    const textAreaH = Math.max(13, heightPx - topRowH - 6);
+    const maxLines = Math.max(1, Math.floor(textAreaH / 13));
+    const label = `${task.startTime}${task.endTime ? `–${task.endTime}` : ""} ${task.text}`;
+
+    return (
+      <div
+        key={task.id + dKey}
+        className={`task-row${shouldPulse ? " pulse-task" : ""}`}
+        style={{
+          position: "absolute",
+          inset: 0,
+          background: bg,
+          border: `1px solid ${COLORS.border}`,
+          borderLeft: `3px solid ${borderLeftColor}`,
+          borderRadius: 6,
+          padding: isTiny ? "1px 4px" : "3px 5px",
+          display: "flex",
+          flexDirection: isTiny ? "row" : "column",
+          alignItems: isTiny ? "center" : "stretch",
+          gap: 2,
+          boxSizing: "border-box",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 0, flex: isTiny ? "1 1 auto" : "0 0 auto", overflow: "hidden" }}>
+          <button
+            onClick={() => toggleCompletion(task.id, dKey)}
+            aria-label={done ? "Kész" : "Nincs kész"}
+            style={{
+              width: 13,
+              height: 13,
+              borderRadius: 4,
+              border: `1.3px solid ${COLORS.accent}`,
+              background: done ? COLORS.accent : "transparent",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              flexShrink: 0,
+              padding: 0,
+              fontSize: 8,
+              lineHeight: 1,
+            }}
+          >
+            {done && "✓"}
+          </button>
+          {isTiny && (
+            editingId === task.id ? (
+              <input
+                autoFocus
+                value={editText}
+                onChange={(e) => setEditText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") saveEditText(); if (e.key === "Escape") cancelEditText(); }}
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  fontSize: 11,
+                  minWidth: 0,
+                  flex: "1 1 auto",
+                  border: `1px solid ${COLORS.accentDark}`,
+                  borderRadius: 4,
+                  padding: "0 3px",
+                  fontFamily: "'Work Sans', sans-serif",
+                }}
+              />
+            ) : (
+            <span
+              title={task.text}
+              style={{
+                fontSize: 11,
+                lineHeight: 1.15,
+                minWidth: 0,
+                flex: "1 1 auto",
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                textDecoration: done ? "line-through" : "none",
+                color: done ? COLORS.textSoft : textColor,
+                fontWeight: 500,
+              }}
+            >
+              {label}
+            </span>
+            )
+          )}
+          {!isTiny && <div style={{ flex: 1 }} />}
+          <button
+            onClick={() => startEditText(task)}
+            aria-label="Szerkesztés"
+            title="Név szerkesztése"
+            style={{ border: "none", background: "transparent", cursor: "pointer", color: COLORS.textSoft, flexShrink: 0, padding: 0, fontSize: 10, lineHeight: 1 }}
+          >
+            ✏️
+          </button>
+          <button
+            onClick={() => toggleColorPicker(task.id)}
+            aria-label="Szín"
+            title="Szín"
+            style={{
+              border: `1.3px solid ${task.color ? darkenHex(task.color, 25) : COLORS.border}`,
+              background: task.color || "repeating-linear-gradient(45deg, #fff, #fff 2px, #eee 2px, #eee 4px)",
+              width: 11,
+              height: 11,
+              borderRadius: "50%",
+              cursor: "pointer",
+              flexShrink: 0,
+              padding: 0,
+            }}
+          />
+          <button
+            onClick={() => toggleNoteOpen(task.id)}
+            aria-label="Jegyzet"
+            title="Jegyzet"
+            style={{ border: "none", background: "transparent", cursor: "pointer", color: task.note ? COLORS.accentDark : COLORS.textSoft, flexShrink: 0, padding: 0, fontSize: 10, lineHeight: 1 }}
+          >
+            🗒️
+          </button>
+          <button
+            onClick={() => requestDeleteTask(task, dKey)}
+            aria-label="Törlés"
+            style={{ border: "none", background: "transparent", cursor: "pointer", color: COLORS.textSoft, flexShrink: 0, padding: 0 }}
+          >
+            <X size={11} />
+          </button>
+        </div>
+        {!isTiny && (
+          editingId === task.id ? (
+            <input
+              autoFocus
+              value={editText}
+              onChange={(e) => setEditText(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") saveEditText(); if (e.key === "Escape") cancelEditText(); }}
+              style={{
+                fontSize: 11,
+                border: `1px solid ${COLORS.accentDark}`,
+                borderRadius: 4,
+                padding: "2px 4px",
+                fontFamily: "'Work Sans', sans-serif",
+                width: "100%",
+                boxSizing: "border-box",
+              }}
+            />
+          ) : (
+          <div
+            title={task.text}
+            style={{
+              fontSize: 11,
+              lineHeight: "13px",
+              color: done ? COLORS.textSoft : textColor,
+              textDecoration: done ? "line-through" : "none",
+              fontWeight: 500,
+              display: "-webkit-box",
+              WebkitLineClamp: maxLines,
+              WebkitBoxOrient: "vertical",
+              overflow: "hidden",
+              wordBreak: "break-word",
+            }}
+          >
+            {label}
+          </div>
+          )
+        )}
+        {task.recurrence !== "none" && !isTiny && (
+          <span title={RECUR_LABELS[task.recurrence]} style={{ color: COLORS.textSoft, display: "flex" }}>
+            <RefreshCw size={9} />
+          </span>
+        )}
+        {colorPickerOpen.has(task.id) && (
+          <div
+            style={{
+              position: "absolute",
+              top: "100%",
+              left: 0,
+              right: 0,
+              marginTop: 2,
+              zIndex: 21,
+              background: "#fff",
+              border: `1px solid ${COLORS.border}`,
+              borderRadius: 8,
+              padding: 6,
+              boxShadow: "0 4px 10px rgba(0,0,0,0.12)",
+            }}
+          >
+            <ColorSwatchRow
+              value={task.color || null}
+              onChange={(c) => { updateTaskColor(task.id, c); toggleColorPicker(task.id); }}
+              small
+            />
+          </div>
+        )}
+        {editingId === task.id && (
+          <div
+            style={{
+              position: "absolute",
+              top: "100%",
+              left: 0,
+              right: 0,
+              marginTop: 2,
+              zIndex: 22,
+              background: "#fff",
+              border: `1px solid ${COLORS.border}`,
+              borderRadius: 8,
+              padding: 6,
+              boxShadow: "0 4px 10px rgba(0,0,0,0.12)",
+              minWidth: 140,
+            }}
+          >
+            <EditFieldsPanel showTimeAndRecurrence />
+          </div>
+        )}
+        {expandedNotes.has(task.id) && (
+          <div
+            style={{
+              position: "absolute",
+              top: "100%",
+              left: 0,
+              right: 0,
+              marginTop: 2,
+              zIndex: 20,
+              background: "#fff",
+              border: `1px solid ${COLORS.border}`,
+              borderRadius: 8,
+              padding: 6,
+              boxShadow: "0 4px 10px rgba(0,0,0,0.12)",
+            }}
+          >
+            <textarea
+              value={task.note || ""}
+              onChange={(e) => updateTaskNote(task.id, e.target.value)}
+              placeholder="Jegyzet ehhez a teendőhöz…"
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                fontSize: 12,
+                padding: "5px 7px",
+                borderRadius: 8,
+                border: `1px solid ${COLORS.border}`,
+                background: "#fff",
+                fontFamily: "'Work Sans', sans-serif",
+                resize: "vertical",
+                minHeight: 40,
+              }}
+            />
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function renderDayBody(dayTasks, dKey, isTodayCol, isAddingHere) {
+    const untimed = dayTasks.filter((t) => !t.startTime);
+    const timedRaw = dayTasks.filter((t) => t.startTime);
+
+    const timedEvents = timedRaw.map((t) => {
+      const s = clampMin(timeToMinutes(t.startTime) ?? DAY_START_MIN);
+      let e = t.endTime ? timeToMinutes(t.endTime) : null;
+      if (e == null || e <= s) e = s + 60;
+      e = clampMin(e);
+      if (e <= s) e = Math.min(DAY_END_MIN, s + 30);
+      return { task: t, start: s, end: e };
+    });
+    const positioned = assignColumns(timedEvents);
+
+    return (
+      <>
+        {dayTasks.length === 0 && !isAddingHere && (
+          <div style={{ fontSize: 12, color: COLORS.textSoft, fontStyle: "italic", padding: "6px 2px" }}>
+            Nincs teendő
+          </div>
+        )}
+        {untimed.map((task) => renderTaskItem(task, dKey, isTodayCol))}
+
+        {positioned.length > 0 && (
+          <div style={{ marginTop: untimed.length ? 8 : 0, position: "relative", paddingLeft: 26 }}>
+            <div style={{ position: "relative", height: TIMELINE_HEIGHT }}>
+              {HOURS.map((h, idx) => {
+                const top = ((h * 60 - DAY_START_MIN) / 60) * HOUR_HEIGHT;
+                return (
+                  <React.Fragment key={h}>
+                    <div style={{ position: "absolute", top: top - 6, left: -26, width: 22, fontSize: 10, color: COLORS.textSoft, fontWeight: 600, textAlign: "right" }}>
+                      {h}
+                    </div>
+                    <div style={{ position: "absolute", top, left: 0, right: 0, borderTop: `1px solid ${COLORS.border}` }} />
+                    {idx < HOURS.length - 1 && (
+                      <>
+                        <div style={{ position: "absolute", top: top + HOUR_HEIGHT / 2 - 6, left: -26, width: 22, textAlign: "right", fontSize: 10, color: COLORS.border }}>
+                          –
+                        </div>
+                        <div style={{ position: "absolute", top: top + HOUR_HEIGHT / 2, left: 0, right: 0, borderTop: `1px dashed ${COLORS.border}`, opacity: 0.55 }} />
+                      </>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+              {positioned.map((ev) => {
+                const top = ((ev.start - DAY_START_MIN) / 60) * HOUR_HEIGHT;
+                const height = Math.max(20, ((ev.end - ev.start) / 60) * HOUR_HEIGHT);
+                const widthPct = 100 / ev.totalCols;
+                const leftPct = ev.col * widthPct;
+                return (
+                  <div
+                    key={ev.task.id + dKey}
+                    style={{
+                      position: "absolute",
+                      top,
+                      height,
+                      left: `calc(${leftPct}% + 1px)`,
+                      width: `calc(${widthPct}% - 3px)`,
+                    }}
+                  >
+                    {renderEventBlock(ev.task, dKey, isTodayCol, ev.start, ev.end)}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </>
+    );
   }
 
   function toggleCompletion(taskId, dKey) {
@@ -390,12 +1448,69 @@ function WeeklyPlanner() {
     setTasks((ts) => ts.filter((t) => t.id !== taskId));
   }
 
+  // Törlés kérése: ha ismétlődő, vagy több, azonos nevű esemény is van,
+  // megkérdezzük, hogy csak ezt az egyet, vagy a rá következő azonos
+  // nevű/ismétlődő alkalmakat is törölje-e.
+  function requestDeleteTask(task, dKey) {
+    if (task.recurrence !== "none") {
+      setDeleteConfirm({ task, dKey });
+      return;
+    }
+    const hasSameName = tasks.some((t) => t.id !== task.id && t.text === task.text);
+    if (hasSameName) {
+      setDeleteConfirm({ task, dKey });
+    } else {
+      deleteTask(task.id);
+    }
+  }
+
+  function confirmDeleteOnlyThis() {
+    if (!deleteConfirm) return;
+    const { task, dKey } = deleteConfirm;
+    if (task.recurrence !== "none") {
+      setTasks((ts) =>
+        ts.map((t) =>
+          t.id === task.id
+            ? { ...t, excludedDates: [...(t.excludedDates || []), dKey] }
+            : t
+        )
+      );
+    } else {
+      deleteTask(task.id);
+    }
+    setDeleteConfirm(null);
+  }
+
+  function confirmDeleteAllFollowing() {
+    if (!deleteConfirm) return;
+    const { task } = deleteConfirm;
+    if (task.recurrence !== "none") {
+      deleteTask(task.id);
+    } else {
+      setTasks((ts) =>
+        ts.filter((t) => !(t.text === task.text && daysBetween(task.anchorDate, t.anchorDate) >= 0))
+      );
+    }
+    setDeleteConfirm(null);
+  }
+
+  function clearAllTasks() {
+    if (window.confirm("Biztosan törlöd a TELJES naptárat? Minden heti/napi teendő véglegesen törlődik, ez nem vonható vissza.")) {
+      setTasks([]);
+    }
+  }
+
+  function updateTaskNote(taskId, note) {
+    setTasks((ts) => ts.map((t) => (t.id === taskId ? { ...t, note } : t)));
+  }
+
   function addGeneralTask() {
     const text = generalText.trim();
     if (!text) return;
-    setGeneralTasks((gs) => [...gs, { id: nextId(), text, category: generalCategory, completed: false }]);
+    setGeneralTasks((gs) => [...gs, { id: nextId(), text, category: generalCategory, completed: false, note: "", color: generalColor }]);
     setGeneralText("");
     setGeneralCategory("none");
+    setGeneralColor(null);
   }
   function toggleGeneralTask(id) {
     setGeneralTasks((gs) => gs.map((g) => (g.id === id ? { ...g, completed: !g.completed } : g)));
@@ -403,6 +1518,16 @@ function WeeklyPlanner() {
   function deleteGeneralTask(id) {
     setGeneralTasks((gs) => gs.filter((g) => g.id !== id));
   }
+  function updateGeneralNote(id, note) {
+    setGeneralTasks((gs) => gs.map((g) => (g.id === id ? { ...g, note } : g)));
+  }
+  function updateGeneralColor(id, color) {
+    setGeneralTasks((gs) => gs.map((g) => (g.id === id ? { ...g, color } : g)));
+  }
+  function updateTaskColor(taskId, color) {
+    setTasks((ts) => ts.map((t) => (t.id === taskId ? { ...t, color } : t)));
+  }
+
 
   return (
     <div
@@ -532,7 +1657,7 @@ function WeeklyPlanner() {
               ))}
               {monthMatrix.map((d, i) => {
                 const inMonth = d.getMonth() === weekStart.getMonth();
-                const isToday = isSameDay(d, today);
+                const isToday = isSameDay(d, getToday());
                 const inCurrentWeek = weekDays.some((wd) => isSameDay(wd, d));
                 return (
                   <button
@@ -560,7 +1685,7 @@ function WeeklyPlanner() {
         </div>
 
         {/* Category filter */}
-        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
           {CATEGORY_FILTERS.map((f) => {
             const active = categoryFilter === f.value;
             const style = CATEGORY_STYLES[f.value];
@@ -584,21 +1709,106 @@ function WeeklyPlanner() {
               </button>
             );
           })}
+
+          <button
+            onClick={handleImportClick}
+            style={{
+              fontSize: 12,
+              fontWeight: 500,
+              padding: "6px 14px",
+              borderRadius: 999,
+              border: `1px dashed ${COLORS.accentDark}`,
+              background: "transparent",
+              color: COLORS.accentDark,
+              cursor: "pointer",
+              marginLeft: "auto",
+            }}
+          >
+            📥 Naptár importálása (Excel / PDF / kép)
+          </button>
+          <button
+            onClick={clearAllTasks}
+            style={{
+              fontSize: 12,
+              fontWeight: 500,
+              padding: "6px 14px",
+              borderRadius: 999,
+              border: `1px solid #E8AEAE`,
+              background: "transparent",
+              color: "#B33A3A",
+              cursor: "pointer",
+            }}
+          >
+            🗑️ Naptár törlése
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv,.pdf,image/*"
+            onChange={handleImportFile}
+            style={{ display: "none" }}
+          />
         </div>
+
+        {importMessage && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 10,
+              fontSize: 12,
+              padding: "8px 12px",
+              borderRadius: 10,
+              marginBottom: 14,
+              background: importMessage.type === "error" ? "#FBE4E4" : COLORS.panel,
+              color: importMessage.type === "error" ? "#B33A3A" : COLORS.accentDark,
+              border: `1px solid ${importMessage.type === "error" ? "#E8AEAE" : COLORS.border}`,
+            }}
+          >
+            <span>{importMessage.text}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+              {importMessage.type === "success" && lastImportIds.length > 0 && (
+                <button
+                  onClick={undoImport}
+                  style={{
+                    border: `1px solid ${COLORS.accentDark}`,
+                    background: "transparent",
+                    color: COLORS.accentDark,
+                    borderRadius: 999,
+                    padding: "3px 10px",
+                    fontSize: 11,
+                    fontWeight: 500,
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  Visszavonás
+                </button>
+              )}
+              <button
+                onClick={() => setImportMessage(null)}
+                style={{ border: "none", background: "transparent", cursor: "pointer", color: "inherit" }}
+              >
+                <X size={12} />
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Week grid */}
         {!isCompact && (
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(7, minmax(150px, 1fr))",
+            gridTemplateColumns: "repeat(7, minmax(210px, 1fr))",
             gap: 14,
             overflowX: "auto",
           }}
         >
           {weekDays.map((day) => {
             const dKey = dateKey(day);
-            const isToday = isSameDay(day, today);
+            const isToday = isSameDay(day, getToday());
             const dayTasks = tasks
               .filter((t) => taskOccursOn(t, day))
               .filter((t) => categoryFilter === "all" || t.category === categoryFilter);
@@ -634,108 +1844,8 @@ function WeeklyPlanner() {
                   </div>
                 </div>
 
-                <div className="day-scroll" style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
-                  {dayTasks.length === 0 && !isAdding && (
-                    <div style={{ fontSize: 12, color: COLORS.textSoft, fontStyle: "italic", padding: "6px 2px" }}>
-                      Nincs teendő
-                    </div>
-                  )}
-                  {dayTasks.map((task) => {
-                    const done = !!task.completions[dKey];
-                    const shouldPulse = isToday && task.recurrence !== "none" && !done;
-                    return (
-                      <div
-                        key={task.id + dKey}
-                        className={`task-row${shouldPulse ? " pulse-task" : ""}`}
-                        style={{
-                          display: "flex",
-                          flexDirection: "column",
-                          gap: 5,
-                          background: "#fff",
-                          border: `1px solid ${COLORS.border}`,
-                          borderRadius: 10,
-                          padding: "6px 8px",
-                        }}
-                      >
-                        <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
-                          <button
-                            onClick={() => toggleCompletion(task.id, dKey)}
-                            aria-label={done ? "Kész" : "Nincs kész"}
-                            style={{
-                              width: 20,
-                              height: 20,
-                              borderRadius: 6,
-                              border: `1.5px solid ${COLORS.accent}`,
-                              background: done ? COLORS.panel : "transparent",
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                              cursor: "pointer",
-                              flexShrink: 0,
-                              marginTop: 0,
-                              padding: 0,
-                              fontSize: 12,
-                              lineHeight: 1,
-                            }}
-                          >
-                            {done && "✅"}
-                          </button>
-                          <span
-                            style={{
-                              fontSize: 13,
-                              flex: "1 1 0%",
-                              minWidth: 0,
-                              wordBreak: "break-word",
-                              textDecoration: done ? "line-through" : "none",
-                              color: done ? COLORS.textSoft : COLORS.text,
-                            }}
-                          >
-                            {task.text}
-                          </span>
-                          <button
-                            onClick={() => deleteTask(task.id)}
-                            aria-label="Törlés"
-                            style={{
-                              border: "none",
-                              background: "transparent",
-                              cursor: "pointer",
-                              color: COLORS.textSoft,
-                              opacity: 1,
-                              flexShrink: 0,
-                              padding: 0,
-                              marginTop: 2,
-                            }}
-                          >
-                            <X size={13} />
-                          </button>
-                        </div>
-                        {(task.category !== "none" || task.recurrence !== "none") && (
-                          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 24 }}>
-                            {task.category !== "none" && CATEGORY_STYLES[task.category] && (
-                              <span
-                                style={{
-                                  fontSize: 10,
-                                  fontWeight: 500,
-                                  padding: "2px 7px",
-                                  borderRadius: 999,
-                                  background: CATEGORY_STYLES[task.category].bg,
-                                  color: CATEGORY_STYLES[task.category].text,
-                                  whiteSpace: "nowrap",
-                                }}
-                              >
-                                {CATEGORY_STYLES[task.category].label}
-                              </span>
-                            )}
-                            {task.recurrence !== "none" && (
-                              <span title={RECUR_LABELS[task.recurrence]} style={{ color: COLORS.textSoft, display: "flex" }}>
-                                <RefreshCw size={11} />
-                              </span>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                <div className="day-scroll" style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6, minWidth: 0 }}>
+                  {renderDayBody(dayTasks, dKey, isToday, isAdding)}
                 </div>
 
                 {isAdding ? (
@@ -759,6 +1869,40 @@ function WeeklyPlanner() {
                         fontFamily: "'Work Sans', sans-serif",
                       }}
                     />
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input
+                        type="time"
+                        value={newStartTime}
+                        onChange={(e) => setNewStartTime(e.target.value)}
+                        title="Kezdés (opcionális)"
+                        style={{
+                          flex: 1,
+                          fontSize: 12,
+                          padding: "5px 6px",
+                          borderRadius: 8,
+                          border: `1px solid ${COLORS.border}`,
+                          background: "#fff",
+                          fontFamily: "'Work Sans', sans-serif",
+                          color: COLORS.text,
+                        }}
+                      />
+                      <input
+                        type="time"
+                        value={newEndTime}
+                        onChange={(e) => setNewEndTime(e.target.value)}
+                        title="Vég (opcionális)"
+                        style={{
+                          flex: 1,
+                          fontSize: 12,
+                          padding: "5px 6px",
+                          borderRadius: 8,
+                          border: `1px solid ${COLORS.border}`,
+                          background: "#fff",
+                          fontFamily: "'Work Sans', sans-serif",
+                          color: COLORS.text,
+                        }}
+                      />
+                    </div>
                     <select
                       value={newRecurrence}
                       onChange={(e) => setNewRecurrence(e.target.value)}
@@ -793,6 +1937,7 @@ function WeeklyPlanner() {
                         <option key={o.value} value={o.value}>{o.label}</option>
                       ))}
                     </select>
+                    <ColorSwatchRow value={newColor} onChange={setNewColor} small />
                     <div style={{ display: "flex", gap: 6 }}>
                       <button
                         onClick={() => submitTask(day)}
@@ -856,7 +2001,7 @@ function WeeklyPlanner() {
         {isCompact && (() => {
           const day = selectedDay;
           const dKey = dateKey(day);
-          const isToday = isSameDay(day, today);
+          const isToday = isSameDay(day, getToday());
           const dayTasks = tasks
             .filter((t) => taskOccursOn(t, day))
             .filter((t) => categoryFilter === "all" || t.category === categoryFilter);
@@ -867,7 +2012,7 @@ function WeeklyPlanner() {
               <div style={{ display: "flex", gap: 6, marginBottom: 14, overflowX: "auto" }}>
                 {weekDays.map((d, i) => {
                   const sel = isSameDay(d, selectedDay);
-                  const todayCol = isSameDay(d, today);
+                  const todayCol = isSameDay(d, getToday());
                   return (
                     <button
                       key={i}
@@ -920,107 +2065,8 @@ function WeeklyPlanner() {
                   </div>
                 </div>
 
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {dayTasks.length === 0 && !isAdding && (
-                    <div style={{ fontSize: 12, color: COLORS.textSoft, fontStyle: "italic", padding: "6px 2px" }}>
-                      Nincs teendő
-                    </div>
-                  )}
-                  {dayTasks.map((task) => {
-                    const done = !!task.completions[dKey];
-                    const shouldPulse = isToday && task.recurrence !== "none" && !done;
-                    return (
-                      <div
-                        key={task.id + dKey}
-                        className={`task-row${shouldPulse ? " pulse-task" : ""}`}
-                        style={{
-                          display: "flex",
-                          flexDirection: "column",
-                          gap: 5,
-                          background: "#fff",
-                          border: `1px solid ${COLORS.border}`,
-                          borderRadius: 10,
-                          padding: "6px 8px",
-                        }}
-                      >
-                        <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
-                          <button
-                            onClick={() => toggleCompletion(task.id, dKey)}
-                            aria-label={done ? "Kész" : "Nincs kész"}
-                            style={{
-                              width: 20,
-                              height: 20,
-                              borderRadius: 6,
-                              border: `1.5px solid ${COLORS.accent}`,
-                              background: done ? COLORS.panel : "transparent",
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                              cursor: "pointer",
-                              flexShrink: 0,
-                              padding: 0,
-                              fontSize: 12,
-                              lineHeight: 1,
-                            }}
-                          >
-                            {done && "✅"}
-                          </button>
-                          <span
-                            style={{
-                              fontSize: 13,
-                              flex: "1 1 0%",
-                              minWidth: 0,
-                              wordBreak: "break-word",
-                              textDecoration: done ? "line-through" : "none",
-                              color: done ? COLORS.textSoft : COLORS.text,
-                            }}
-                          >
-                            {task.text}
-                          </span>
-                          <button
-                            onClick={() => deleteTask(task.id)}
-                            aria-label="Törlés"
-                            style={{
-                              border: "none",
-                              background: "transparent",
-                              cursor: "pointer",
-                              color: COLORS.textSoft,
-                              opacity: 1,
-                              flexShrink: 0,
-                              padding: 0,
-                              marginTop: 2,
-                            }}
-                          >
-                            <X size={13} />
-                          </button>
-                        </div>
-                        {(task.category !== "none" || task.recurrence !== "none") && (
-                          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 24 }}>
-                            {task.category !== "none" && CATEGORY_STYLES[task.category] && (
-                              <span
-                                style={{
-                                  fontSize: 10,
-                                  fontWeight: 500,
-                                  padding: "2px 7px",
-                                  borderRadius: 999,
-                                  background: CATEGORY_STYLES[task.category].bg,
-                                  color: CATEGORY_STYLES[task.category].text,
-                                  whiteSpace: "nowrap",
-                                }}
-                              >
-                                {CATEGORY_STYLES[task.category].label}
-                              </span>
-                            )}
-                            {task.recurrence !== "none" && (
-                              <span title={RECUR_LABELS[task.recurrence]} style={{ color: COLORS.textSoft, display: "flex" }}>
-                                <RefreshCw size={11} />
-                              </span>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 0 }}>
+                  {renderDayBody(dayTasks, dKey, isToday, isAdding)}
                 </div>
 
                 {isAdding ? (
@@ -1044,6 +2090,40 @@ function WeeklyPlanner() {
                         fontFamily: "'Work Sans', sans-serif",
                       }}
                     />
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input
+                        type="time"
+                        value={newStartTime}
+                        onChange={(e) => setNewStartTime(e.target.value)}
+                        title="Kezdés (opcionális)"
+                        style={{
+                          flex: 1,
+                          fontSize: 12,
+                          padding: "5px 6px",
+                          borderRadius: 8,
+                          border: `1px solid ${COLORS.border}`,
+                          background: "#fff",
+                          fontFamily: "'Work Sans', sans-serif",
+                          color: COLORS.text,
+                        }}
+                      />
+                      <input
+                        type="time"
+                        value={newEndTime}
+                        onChange={(e) => setNewEndTime(e.target.value)}
+                        title="Vég (opcionális)"
+                        style={{
+                          flex: 1,
+                          fontSize: 12,
+                          padding: "5px 6px",
+                          borderRadius: 8,
+                          border: `1px solid ${COLORS.border}`,
+                          background: "#fff",
+                          fontFamily: "'Work Sans', sans-serif",
+                          color: COLORS.text,
+                        }}
+                      />
+                    </div>
                     <select
                       value={newRecurrence}
                       onChange={(e) => setNewRecurrence(e.target.value)}
@@ -1078,6 +2158,7 @@ function WeeklyPlanner() {
                         <option key={o.value} value={o.value}>{o.label}</option>
                       ))}
                     </select>
+                    <ColorSwatchRow value={newColor} onChange={setNewColor} small />
                     <div style={{ display: "flex", gap: 6 }}>
                       <button
                         onClick={() => submitTask(day)}
@@ -1180,8 +2261,8 @@ function WeeklyPlanner() {
                   display: "flex",
                   flexDirection: "column",
                   gap: 5,
-                  background: "#fff",
-                  border: `1px solid ${COLORS.border}`,
+                  background: g.color || "#fff",
+                  border: `1px solid ${g.color ? darkenHex(g.color, 25) : COLORS.border}`,
                   borderRadius: 10,
                   padding: "7px 10px",
                 }}
@@ -1209,18 +2290,81 @@ function WeeklyPlanner() {
                   >
                     {g.completed && "✅"}
                   </button>
+                  {editingId === g.id ? (
+                    <input
+                      autoFocus
+                      value={editText}
+                      onChange={(e) => setEditText(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") saveEditText(); if (e.key === "Escape") cancelEditText(); }}
+                      style={{
+                        fontSize: 13,
+                        flex: "1 1 0%",
+                        minWidth: 0,
+                        border: `1px solid ${COLORS.accentDark}`,
+                        borderRadius: 6,
+                        padding: "2px 6px",
+                        fontFamily: "'Work Sans', sans-serif",
+                      }}
+                    />
+                  ) : (
                   <span
                     style={{
                       fontSize: 13,
                       flex: "1 1 0%",
                       minWidth: 0,
-                      wordBreak: "break-word",
+                      whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
                       textDecoration: g.completed ? "line-through" : "none",
                       color: g.completed ? COLORS.textSoft : COLORS.text,
                     }}
                   >
                     {g.text}
                   </span>
+                  )}
+                  <button
+                    onClick={() => startEditText(g)}
+                    aria-label="Szerkesztés"
+                    title="Név szerkesztése"
+                    style={{ border: "none", background: "transparent", cursor: "pointer", color: COLORS.textSoft, flexShrink: 0, padding: 0, marginTop: 3, fontSize: 12 }}
+                  >
+                    ✏️
+                  </button>
+                  <button
+                    onClick={() => toggleColorPicker(g.id)}
+                    aria-label="Szín"
+                    title="Szín"
+                    style={{
+                      border: `1.5px solid ${g.color ? darkenHex(g.color, 25) : COLORS.border}`,
+                      background: g.color || "repeating-linear-gradient(45deg, #fff, #fff 2px, #eee 2px, #eee 4px)",
+                      width: 14,
+                      height: 14,
+                      borderRadius: "50%",
+                      cursor: "pointer",
+                      flexShrink: 0,
+                      padding: 0,
+                      marginTop: 3,
+                    }}
+                  />
+                  <button
+                    onClick={() => toggleNoteOpen(g.id)}
+                    aria-label="Jegyzet"
+                    title="Jegyzet"
+                    style={{
+                      border: "none",
+                      background: "transparent",
+                      cursor: "pointer",
+                      color: g.note ? COLORS.accentDark : COLORS.textSoft,
+                      opacity: 1,
+                      flexShrink: 0,
+                      padding: 0,
+                      marginTop: 2,
+                      fontSize: 13,
+                      lineHeight: 1,
+                    }}
+                  >
+                    🗒️
+                  </button>
                   <button
                     onClick={() => deleteGeneralTask(g.id)}
                     aria-label="Törlés"
@@ -1238,6 +2382,20 @@ function WeeklyPlanner() {
                     <X size={13} />
                   </button>
                 </div>
+                {colorPickerOpen.has(g.id) && (
+                  <div style={{ marginLeft: 24, background: "#fff", border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 6 }}>
+                    <ColorSwatchRow
+                      value={g.color || null}
+                      onChange={(c) => { updateGeneralColor(g.id, c); toggleColorPicker(g.id); }}
+                      small
+                    />
+                  </div>
+                )}
+                {editingId === g.id && (
+                  <div style={{ marginLeft: 24, background: "#fff", border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 6 }}>
+                    <EditFieldsPanel showTimeAndRecurrence={false} />
+                  </div>
+                )}
                 {g.category !== "none" && CATEGORY_STYLES[g.category] && (
                   <div style={{ display: "flex", paddingLeft: 24 }}>
                     <span
@@ -1255,6 +2413,42 @@ function WeeklyPlanner() {
                     </span>
                   </div>
                 )}
+                {expandedNotes.has(g.id) ? (
+                  <textarea
+                    value={g.note || ""}
+                    onChange={(e) => updateGeneralNote(g.id, e.target.value)}
+                    placeholder="Jegyzet ehhez a teendőhöz…"
+                    style={{
+                      marginTop: 4,
+                      marginLeft: 24,
+                      fontSize: 12,
+                      padding: "5px 7px",
+                      borderRadius: 8,
+                      border: `1px solid ${COLORS.border}`,
+                      background: "#fff",
+                      fontFamily: "'Work Sans', sans-serif",
+                      resize: "vertical",
+                      minHeight: 40,
+                    }}
+                  />
+                ) : g.note ? (
+                  <div
+                    onClick={() => toggleNoteOpen(g.id)}
+                    style={{
+                      marginTop: 4,
+                      marginLeft: 24,
+                      fontSize: 11,
+                      fontStyle: "italic",
+                      color: COLORS.textSoft,
+                      cursor: "pointer",
+                      whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+                    }}
+                  >
+                    {g.note}
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>
@@ -1293,6 +2487,7 @@ function WeeklyPlanner() {
                 <option key={o.value} value={o.value}>{o.label}</option>
               ))}
             </select>
+            <ColorSwatchRow value={generalColor} onChange={setGeneralColor} small />
             <button
               onClick={addGeneralTask}
               style={{
@@ -1313,7 +2508,95 @@ function WeeklyPlanner() {
             </button>
           </div>
         </div>
+        <div style={{ textAlign: "center", fontSize: 10, color: COLORS.border, marginTop: 18 }}>
+          build: 2026-09-11-v2-szinek
+        </div>
       </div>
+
+      {deleteConfirm && (
+        <div
+          onClick={() => setDeleteConfirm(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(61,49,50,0.35)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 100,
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#fff",
+              borderRadius: 16,
+              padding: "20px 22px",
+              maxWidth: 360,
+              width: "100%",
+              boxShadow: "0 10px 30px rgba(0,0,0,0.2)",
+            }}
+          >
+            <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 20, color: COLORS.accentDark, marginBottom: 8 }}>
+              Törlés
+            </div>
+            <div style={{ fontSize: 13, color: COLORS.text, marginBottom: 18, lineHeight: 1.5 }}>
+              {deleteConfirm.task.recurrence !== "none"
+                ? `„${deleteConfirm.task.text}" egy ismétlődő teendő. Csak ezt az egy alkalmat törlöd, vagy az egész ismétlődő sorozatot?`
+                : `Több „${deleteConfirm.task.text}" nevű esemény is szerepel a naptárban. Csak ezt az egyet törlöd, vagy ezt és az összes rá következő ugyanilyen nevű eseményt is?`}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <button
+                onClick={confirmDeleteOnlyThis}
+                style={{
+                  padding: "9px 0",
+                  borderRadius: 10,
+                  border: `1px solid ${COLORS.border}`,
+                  background: COLORS.panelSoft,
+                  color: COLORS.text,
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                }}
+              >
+                Csak ezt az egyet
+              </button>
+              <button
+                onClick={confirmDeleteAllFollowing}
+                style={{
+                  padding: "9px 0",
+                  borderRadius: 10,
+                  border: "none",
+                  background: "#B33A3A",
+                  color: "#fff",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                }}
+              >
+                {deleteConfirm.task.recurrence !== "none"
+                  ? "Az egész sorozatot"
+                  : "Ezt és a rá következőket is"}
+              </button>
+              <button
+                onClick={() => setDeleteConfirm(null)}
+                style={{
+                  padding: "9px 0",
+                  borderRadius: 10,
+                  border: "none",
+                  background: "transparent",
+                  color: COLORS.textSoft,
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                Mégse
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
